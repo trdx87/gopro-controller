@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-GoPro camera controller - PySide6 graphical interface with live preview and
-a built-in photo/video viewer.
+GoPro camera controller - PySide6 graphical interface with live preview,
+a photo/video viewer, a filterable file browser, a viewed-image thumbnail
+strip, a video timeline with frame thumbnails, and a media info panel.
 
 This program uses the official "open-gopro" Python package (tested against
 version 0.22.0) to communicate with a GoPro camera over WiFi/BLE or USB
-(Open GoPro API), and exposes the functionality through a simple PySide6
-window. The right side of the window shows either:
-    - a live preview stream from the camera (decoded with OpenCV), or
-    - a photo / video from the camera's file list, downloading it first if
-      it is not already saved locally.
+(Open GoPro API).
 
 Install (one time):
     pip install open-gopro PySide6 opencv-python numpy
@@ -18,20 +15,19 @@ Usage:
     python gopro_gui.py
 
     1. Turn on the GoPro camera.
-    2. Pick a connection mode:
-       - "Wireless (BLE + WiFi)" - requires a Bluetooth adapter on this
-         machine.
-       - "USB (Wired)" - connect the camera to this machine with a USB
-         cable first, and make sure USB connection is enabled on the
-         camera (Settings > Connections > USB Connection > GoPro Connect,
-         depending on camera/firmware).
-    3. Click "Connect".
-    4. Once connected:
-       - Click "Start Preview" to stream a live low-latency preview into
-         the panel on the right.
-       - Or refresh the file list, select a photo/video, and click
-         "View / Play Selected" (or double-click the item) to download it
-         (if needed) and show/play it in the same panel.
+    2. Pick a connection mode and click "Connect".
+    3. Refresh the file list. Use the "Show" dropdown to filter it to All /
+       Photos / Videos.
+    4. Select a file and click "View / Play Selected" (or double-click it)
+       to download it if needed and show/play it on the right.
+       - Photos you've viewed collect as thumbnails in the "Viewed Images"
+         panel next to the file list - click one to show it again without
+         re-downloading.
+       - Videos get a timeline at the bottom of the window with a seek bar
+         and a strip of frame thumbnails sampled across the video (using
+         its actual frame count and fps).
+    5. The "Selected Media Info" panel shows size, date, and format for
+       whichever file is currently selected (once it's been downloaded).
 
 Notes on the design:
     The GoPro library is asyncio-based (async/await), while PySide6 has its
@@ -42,9 +38,20 @@ Notes on the design:
     Qt signals.
 
     The right-hand panel is a QStackedWidget with three pages: an "idle"
-    label, an image label (used for both the live preview frames and for
-    viewing downloaded photos), and a QVideoWidget (used for playing
-    downloaded videos via QMediaPlayer). Only one is shown at a time.
+    label, an image label (live preview frames + viewed photos), and a
+    QVideoWidget (video playback via QMediaPlayer).
+
+    Video frame thumbnails for the timeline are extracted with OpenCV on a
+    background QThread (ThumbnailStripWorker), sampling frame indices
+    computed from the video's real frame count and fps so the thumbnails
+    are spread evenly across its actual duration.
+
+    The info panel intentionally shows local file details (size, modified
+    date, format) rather than camera-reported metadata: the exact metadata
+    fields the camera returns can vary between GoPro models/firmware, while
+    a file that has been downloaded has metadata we can read directly and
+    reliably from disk. Files not yet downloaded show a note asking you to
+    view/download them first.
 
 Note on locale:
     The WiFi adapter used by WirelessGoPro parses the output of system
@@ -65,10 +72,11 @@ os.environ["LC_ALL"] = "en_US.UTF-8"
 import asyncio
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QUrl, Qt, QThread, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QObject, QSize, QUrl, Qt, QThread, Signal
+from PySide6.QtGui import QIcon, QImage, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -78,12 +86,16 @@ from PySide6.QtWidgets import (
     QPushButton,
     QComboBox,
     QListWidget,
+    QListWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QHBoxLayout,
     QGroupBox,
     QMessageBox,
     QStackedWidget,
+    QSlider,
+    QFormLayout,
+    QFrame,
 )
 
 try:
@@ -105,14 +117,17 @@ except ImportError:
 
 DOWNLOAD_DIR = Path("gopro_downloads")
 PREVIEW_PORT = 8554
+TIMELINE_THUMBNAIL_COUNT = 10
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif"}
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".lrv"}
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".gpr"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".lrv", ".360"}
 
 CONNECTION_MODES = {
-    "Wireless (BLE + WiFi)": "wireless",
     "USB (Wired)": "wired",
+    "Wireless (BLE + WiFi)": "wireless",
 }
+
+FILE_FILTERS = ["All", "Photos", "Videos"]
 
 # Preset groups control which "mode" the camera is in (photo/video/timelapse).
 PRESET_GROUP_PHOTO = proto.EnumPresetGroup.PRESET_GROUP_ID_PHOTO
@@ -131,6 +146,48 @@ FRAMERATES = {
     "60 fps": FrameRate.NUM_60_0,
     "30 fps": FrameRate.NUM_30_0,
 }
+
+
+def format_file_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def format_ms(milliseconds: int) -> str:
+    total_seconds = max(milliseconds, 0) // 1000
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def extract_media_item_size(item) -> "int | None":
+    """Best-effort attempt to read a file's size (in bytes) from a media
+    list item returned by the camera. The exact field name can vary
+    between GoPro models/firmware, so this scans whichever fields are
+    present rather than assuming one fixed name."""
+    if hasattr(item, "model_dump"):
+        data = item.model_dump()
+    elif hasattr(item, "dict"):
+        data = item.dict()
+    else:
+        data = vars(item) if hasattr(item, "__dict__") else {}
+
+    for key, value in data.items():
+        key_lower = key.lower()
+        if "size" not in key_lower:
+            continue
+        if "low_res" in key_lower or "lrv" in key_lower:
+            continue  # that's the size of the low-res proxy, not the real file
+        try:
+            size = int(value)
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            return size
+    return None
 
 
 class PreviewWorker(QThread):
@@ -159,16 +216,63 @@ class PreviewWorker(QThread):
             ok, frame = capture.read()
             if not ok:
                 continue
-            # OpenCV gives frames as BGR; Qt expects RGB.
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             height, width, channels = rgb_frame.shape
             bytes_per_line = channels * width
             image = QImage(
                 rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888
-            ).copy()  # copy() so the buffer survives after this loop iteration
+            ).copy()
             self.frame_ready.emit(image)
 
         capture.release()
+
+
+class ThumbnailStripWorker(QThread):
+    """Extracts a handful of frame thumbnails spread evenly across a video's
+    real duration (computed from its frame count and fps), using OpenCV.
+    Runs on its own thread since decoding frames is a blocking operation."""
+
+    thumbnails_ready = Signal(list)  # list[QPixmap]
+    error = Signal(str)
+
+    def __init__(self, video_path: str, count: int = TIMELINE_THUMBNAIL_COUNT):
+        super().__init__()
+        self._path = video_path
+        self._count = count
+
+    def run(self):
+        capture = cv2.VideoCapture(self._path)
+        if not capture.isOpened():
+            self.error.emit("Could not open the video with OpenCV for thumbnails.")
+            return
+
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0
+        if frame_count <= 0 or fps <= 0:
+            self.error.emit("Could not determine the video's frame count/fps.")
+            capture.release()
+            return
+
+        # Evenly spaced frame indices across the whole video.
+        step = max(frame_count - 1, 1) / max(self._count - 1, 1)
+        indices = [int(round(i * step)) for i in range(self._count)]
+
+        thumbnails = []
+        for index in indices:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            height, width, channels = rgb_frame.shape
+            bytes_per_line = channels * width
+            image = QImage(
+                rgb_frame.data, width, height, bytes_per_line, QImage.Format_RGB888
+            ).copy()
+            thumbnails.append(QPixmap.fromImage(image))
+
+        capture.release()
+        self.thumbnails_ready.emit(thumbnails)
 
 
 class GoProController(QObject):
@@ -184,22 +288,21 @@ class GoProController(QObject):
     preview_started = Signal(str)  # emits the stream URL
     preview_stopped = Signal()
     media_ready_to_view = Signal(str)  # emits a local file path
+    download_progress = Signal(str, int, int)  # filename, bytes_so_far, total_bytes (0 if unknown)
 
     def __init__(self):
         super().__init__()
         self.gopro = None
+        self._media_sizes = {}  # filename -> size in bytes, best-effort
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
     def _run_loop(self):
-        # Runs on the background thread and keeps the asyncio loop alive.
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
     def _submit(self, coro):
-        """Schedule a coroutine on the background event loop in a
-        thread-safe way."""
         asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     # --- Public methods callable from the GUI buttons ---------------------
@@ -335,8 +438,6 @@ class GoProController(QObject):
             battery_pct = None
             status = getattr(state.data, "status", None)
             if status:
-                # The status object stores state as key-value pairs; find
-                # the battery-related entry by matching its enum name.
                 for key, value in status.items():
                     key_name = getattr(key, "name", str(key))
                     if "BATTERY" in key_name.upper():
@@ -355,24 +456,62 @@ class GoProController(QObject):
         try:
             media = (await self.gopro.http_command.get_media_list()).data.files
             filenames = [item.filename for item in media]
+            self._media_sizes = {
+                item.filename: extract_media_item_size(item) for item in media
+            }
             self.media_list_ready.emit(filenames)
             self.log_message.emit(f"Found {len(filenames)} file(s) on the camera.")
         except Exception as exc:
             self.log_message.emit(f"Error while fetching the media list: {exc}")
 
-    async def _ensure_downloaded(self, filename: str) -> Path:
-        """Downloads the given camera file to DOWNLOAD_DIR if it is not
-        already there, and returns its local path."""
+    async def _monitor_download_progress(self, filename: str, local_path: Path, total_size):
+        try:
+            while True:
+                await asyncio.sleep(0.3)
+                if local_path.exists():
+                    current = local_path.stat().st_size
+                    self.download_progress.emit(filename, current, total_size or 0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _ensure_downloaded(self, filename: str, attempts: int = 3) -> Path:
         local_path = DOWNLOAD_DIR / filename
         if local_path.exists():
             return local_path
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_message.emit(f"Downloading: {filename}...")
-        await self.gopro.http_command.download_file(
-            camera_file=filename, local_file=local_path
-        )
-        self.log_message.emit(f"Downloaded to: {local_path}")
-        return local_path
+        total_size = self._media_sizes.get(filename)
+
+        last_error = None
+        for attempt in range(1, attempts + 1):
+            if local_path.exists():
+                local_path.unlink()
+            monitor_task = asyncio.create_task(
+                self._monitor_download_progress(filename, local_path, total_size)
+            )
+            try:
+                if attempt == 1:
+                    self.log_message.emit(f"Downloading: {filename}...")
+                else:
+                    self.log_message.emit(
+                        f"Retrying download of {filename} (attempt {attempt}/{attempts})..."
+                    )
+                await self.gopro.http_command.download_file(
+                    camera_file=filename, local_file=local_path
+                )
+                monitor_task.cancel()
+                self.download_progress.emit(filename, total_size or 100, total_size or 100)
+                self.log_message.emit(f"Downloaded to: {local_path}")
+                return local_path
+            except Exception as exc:
+                monitor_task.cancel()
+                last_error = exc
+                self.log_message.emit(f"Download attempt {attempt} failed: {exc}")
+                if local_path.exists():
+                    local_path.unlink()
+                if attempt < attempts:
+                    await asyncio.sleep(2)
+
+        raise last_error
 
     async def _download_file(self, filename: str):
         if not self.gopro:
@@ -430,19 +569,29 @@ class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GoPro Controller")
-        self.resize(980, 640)
+        self.resize(1150, 820)
 
         self.controller = GoProController()
         self.is_recording = False
         self.preview_worker = None
+        self.thumbnail_worker = None
+        self.all_filenames = []  # unfiltered file list from the camera
+        self.viewed_image_paths = set()
+        self._slider_being_dragged = False
+        self._loading_filename = None
 
         self._build_ui()
         self._connect_signals()
 
-    def _build_ui(self):
-        root_layout = QHBoxLayout(self)
+    # --- UI construction -----------------------------------------------
 
-        # --- Left side: all of the existing controls ---
+    def _build_ui(self):
+        outer_layout = QVBoxLayout(self)
+
+        top_layout = QHBoxLayout()
+        outer_layout.addLayout(top_layout, stretch=1)
+
+        # ================= LEFT SIDE =================
         left_panel = QWidget()
         layout = QVBoxLayout(left_panel)
 
@@ -495,22 +644,68 @@ class MainWindow(QWidget):
         settings_layout.addWidget(self.fps_apply_btn)
         layout.addWidget(settings_box)
 
-        # --- Files ---
+        # --- Files on Camera: split into file browser + viewed thumbnails ---
         files_box = QGroupBox("Files on Camera")
-        files_layout = QVBoxLayout(files_box)
+        files_split_layout = QHBoxLayout(files_box)
+
+        # -- Left half: filterable file list --
+        file_browser_widget = QWidget()
+        file_browser_layout = QVBoxLayout(file_browser_widget)
+        file_browser_layout.setContentsMargins(0, 0, 0, 0)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Show:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(FILE_FILTERS)
+        filter_row.addWidget(self.filter_combo)
+        file_browser_layout.addLayout(filter_row)
+
         files_btn_layout = QHBoxLayout()
-        self.refresh_files_btn = QPushButton("Refresh File List")
-        self.view_selected_btn = QPushButton("View / Play Selected")
-        self.download_selected_btn = QPushButton("Download Selected")
+        self.refresh_files_btn = QPushButton("Refresh")
+        self.view_selected_btn = QPushButton("View / Play")
+        self.download_selected_btn = QPushButton("Download")
         self.download_all_btn = QPushButton("Download All")
         files_btn_layout.addWidget(self.refresh_files_btn)
         files_btn_layout.addWidget(self.view_selected_btn)
         files_btn_layout.addWidget(self.download_selected_btn)
         files_btn_layout.addWidget(self.download_all_btn)
+        file_browser_layout.addLayout(files_btn_layout)
+
         self.file_list = QListWidget()
-        files_layout.addLayout(files_btn_layout)
-        files_layout.addWidget(self.file_list)
+        file_browser_layout.addWidget(self.file_list)
+
+        files_split_layout.addWidget(file_browser_widget, stretch=1)
+
+        # -- Right half: thumbnails of already-viewed images --
+        viewed_widget = QWidget()
+        viewed_layout = QVBoxLayout(viewed_widget)
+        viewed_layout.setContentsMargins(0, 0, 0, 0)
+        viewed_layout.addWidget(QLabel("Viewed Images"))
+
+        self.viewed_thumbs_list = QListWidget()
+        self.viewed_thumbs_list.setViewMode(QListWidget.IconMode)
+        self.viewed_thumbs_list.setIconSize(QSize(96, 96))
+        self.viewed_thumbs_list.setResizeMode(QListWidget.Adjust)
+        self.viewed_thumbs_list.setMovement(QListWidget.Static)
+        self.viewed_thumbs_list.setWrapping(True)
+        viewed_layout.addWidget(self.viewed_thumbs_list)
+
+        files_split_layout.addWidget(viewed_widget, stretch=1)
+
         layout.addWidget(files_box)
+
+        # --- Selected Media Info ---
+        info_box = QGroupBox("Selected Media Info")
+        info_form = QFormLayout(info_box)
+        self.info_filename_label = QLabel("-")
+        self.info_size_label = QLabel("-")
+        self.info_date_label = QLabel("-")
+        self.info_format_label = QLabel("-")
+        info_form.addRow("Filename:", self.info_filename_label)
+        info_form.addRow("Size:", self.info_size_label)
+        info_form.addRow("Date:", self.info_date_label)
+        info_form.addRow("Format:", self.info_format_label)
+        layout.addWidget(info_box)
 
         # --- Log ---
         log_box = QGroupBox("Log")
@@ -520,9 +715,9 @@ class MainWindow(QWidget):
         log_layout.addWidget(self.log_view)
         layout.addWidget(log_box)
 
-        root_layout.addWidget(left_panel, stretch=1)
+        top_layout.addWidget(left_panel, stretch=1)
 
-        # --- Right side: live preview / media viewer ---
+        # ================= RIGHT SIDE: preview / viewer =================
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
@@ -543,8 +738,8 @@ class MainWindow(QWidget):
 
         self.video_widget = QVideoWidget()
 
-        self.media_stack.addWidget(self.idle_label)   # index 0
-        self.media_stack.addWidget(self.image_label)  # index 1
+        self.media_stack.addWidget(self.idle_label)    # index 0
+        self.media_stack.addWidget(self.image_label)   # index 1
         self.media_stack.addWidget(self.video_widget)  # index 2
 
         preview_layout.addWidget(self.media_stack)
@@ -563,12 +758,58 @@ class MainWindow(QWidget):
         preview_layout.addLayout(preview_btn_layout)
 
         right_layout.addWidget(preview_box)
-        root_layout.addWidget(right_panel, stretch=1)
+        top_layout.addWidget(right_panel, stretch=1)
+
+        # ================= BOTTOM: video timeline =================
+        timeline_box = QGroupBox("Timeline")
+        timeline_layout = QVBoxLayout(timeline_box)
+
+        self.timeline_thumbs_container = QWidget()
+        self.timeline_thumbs_container.setFixedHeight(54)
+        self.timeline_thumbs_layout = QHBoxLayout(self.timeline_thumbs_container)
+        self.timeline_thumbs_layout.setContentsMargins(0, 0, 0, 0)
+        self.timeline_thumbs_layout.setSpacing(0)
+        self.timeline_thumb_labels = []
+        for _ in range(TIMELINE_THUMBNAIL_COUNT):
+            thumb_label = QLabel(self.timeline_thumbs_container)
+            thumb_label.setFixedSize(96, 54)
+            thumb_label.setStyleSheet("background-color: #222; color: #888;")
+            thumb_label.setAlignment(Qt.AlignCenter)
+            self.timeline_thumbs_layout.addWidget(thumb_label)
+            self.timeline_thumb_labels.append(thumb_label)
+        timeline_layout.addWidget(self.timeline_thumbs_container)
+
+        # A thin vertical line drawn on top of the thumbnail strip, showing
+        # the video's current playback position. It is a free-floating child
+        # of the container (not part of the QHBoxLayout above), so we can
+        # move it to any x position and have it render above the thumbnails.
+        self.timeline_cursor = QFrame(self.timeline_thumbs_container)
+        self.timeline_cursor.setStyleSheet("background-color: #ff3b30;")
+        self.timeline_cursor.setFixedWidth(2)
+        self.timeline_cursor.resize(2, 54)
+        self.timeline_cursor.move(0, 0)
+        self.timeline_cursor.raise_()
+        self.timeline_cursor.hide()
+
+        slider_row = QHBoxLayout()
+        self.play_pause_btn = QPushButton("Play")
+        self.play_pause_btn.setEnabled(False)
+        self.timeline_time_label = QLabel("00:00 / 00:00")
+        self.timeline_slider = QSlider(Qt.Horizontal)
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.setEnabled(False)
+        slider_row.addWidget(self.play_pause_btn)
+        slider_row.addWidget(self.timeline_slider, stretch=1)
+        slider_row.addWidget(self.timeline_time_label)
+        timeline_layout.addLayout(slider_row)
+
+        outer_layout.addWidget(timeline_box)
 
         if not CV2_AVAILABLE:
             self.start_preview_btn.setEnabled(False)
             self.start_preview_btn.setToolTip(
-                "Live preview needs OpenCV. Install it with: pip install opencv-python"
+                "Live preview and video thumbnails need OpenCV. "
+                "Install it with: pip install opencv-python"
             )
 
         self._set_controls_enabled(False)
@@ -591,8 +832,20 @@ class MainWindow(QWidget):
         self.download_selected_btn.clicked.connect(self._download_selected)
         self.download_all_btn.clicked.connect(self._download_all)
         self.file_list.itemDoubleClicked.connect(lambda _: self._view_selected())
+        self.file_list.currentItemChanged.connect(self._on_file_selection_changed)
+        self.filter_combo.currentTextChanged.connect(self._apply_filter)
+        self.viewed_thumbs_list.itemClicked.connect(self._on_viewed_thumbnail_clicked)
         self.start_preview_btn.clicked.connect(self._on_start_preview_clicked)
         self.stop_preview_btn.clicked.connect(self.controller.stop_preview)
+
+        # Timeline slider <-> media player
+        self.play_pause_btn.clicked.connect(self._toggle_playback)
+        self.timeline_slider.sliderPressed.connect(self._on_timeline_slider_pressed)
+        self.timeline_slider.sliderMoved.connect(self._on_timeline_slider_moved)
+        self.timeline_slider.sliderReleased.connect(self._on_timeline_slider_released)
+        self.media_player.positionChanged.connect(self._on_player_position_changed)
+        self.media_player.durationChanged.connect(self._on_player_duration_changed)
+        self.media_player.playbackStateChanged.connect(self._on_playback_state_changed)
 
         # Controller -> GUI
         self.controller.log_message.connect(self._append_log)
@@ -606,6 +859,7 @@ class MainWindow(QWidget):
         self.controller.preview_started.connect(self._on_preview_started)
         self.controller.preview_stopped.connect(self._on_preview_stopped)
         self.controller.media_ready_to_view.connect(self._on_media_ready_to_view)
+        self.controller.download_progress.connect(self._on_download_progress)
 
     def _set_controls_enabled(self, enabled: bool):
         for widget in (
@@ -622,6 +876,8 @@ class MainWindow(QWidget):
         if CV2_AVAILABLE:
             self.start_preview_btn.setEnabled(enabled)
 
+    # --- Connection / capture / settings handlers --------------------------
+
     def _on_connect_clicked(self):
         mode = CONNECTION_MODES[self.mode_combo.currentText()]
         self.controller.connect(mode)
@@ -631,6 +887,19 @@ class MainWindow(QWidget):
             self.controller.stop_recording()
         else:
             self.controller.start_recording()
+
+    # --- File browser / filter ----------------------------------------------
+
+    def _apply_filter(self):
+        choice = self.filter_combo.currentText()
+        self.file_list.clear()
+        for filename in self.all_filenames:
+            ext = Path(filename).suffix.lower()
+            if choice == "Photos" and ext not in PHOTO_EXTENSIONS:
+                continue
+            if choice == "Videos" and ext not in VIDEO_EXTENSIONS:
+                continue
+            self.file_list.addItem(filename)
 
     def _selected_filename(self):
         item = self.file_list.currentItem()
@@ -645,7 +914,7 @@ class MainWindow(QWidget):
             self.controller.download_file(filename)
 
     def _download_all(self):
-        filenames = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+        filenames = self.all_filenames
         if not filenames:
             QMessageBox.information(self, "Empty list", "Refresh the file list first.")
             return
@@ -655,18 +924,46 @@ class MainWindow(QWidget):
         filename = self._selected_filename()
         if not filename:
             return
-        # Viewing a file and the live preview both use the same panel, so
-        # stop any active preview stream first to avoid the two clashing.
         if self.stop_preview_btn.isEnabled():
             self.controller.stop_preview()
         self.media_player.stop()
         self.idle_label.setText(f"Loading {filename}...")
         self.media_stack.setCurrentWidget(self.idle_label)
+        self._loading_filename = filename
         self.controller.view_file(filename)
 
     def _on_start_preview_clicked(self):
         self.media_player.stop()
         self.controller.start_preview()
+
+    def _on_file_selection_changed(self, current: QListWidgetItem, _previous):
+        if current is None:
+            self._clear_info_panel()
+            return
+        filename = current.text()
+        local_path = DOWNLOAD_DIR / filename
+        self._update_info_panel(filename, local_path)
+
+    # --- Media info panel ----------------------------------------------------
+
+    def _clear_info_panel(self):
+        self.info_filename_label.setText("-")
+        self.info_size_label.setText("-")
+        self.info_date_label.setText("-")
+        self.info_format_label.setText("-")
+
+    def _update_info_panel(self, filename: str, local_path: Path):
+        self.info_filename_label.setText(Path(filename).name)
+        self.info_format_label.setText(Path(filename).suffix.upper().lstrip(".") or "Unknown")
+        if local_path.exists():
+            stat = local_path.stat()
+            self.info_size_label.setText(format_file_size(stat.st_size))
+            self.info_date_label.setText(
+                datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            )
+        else:
+            self.info_size_label.setText("Not downloaded yet")
+            self.info_date_label.setText("Not downloaded yet")
 
     # --- Signal handlers (always run on the GUI thread) --------------------
 
@@ -683,8 +980,8 @@ class MainWindow(QWidget):
             self.battery_label.setText("Battery: -")
 
     def _on_media_list_ready(self, filenames: list):
-        self.file_list.clear()
-        self.file_list.addItems(filenames)
+        self.all_filenames = filenames
+        self._apply_filter()
 
     def _on_recording_changed(self, recording: bool):
         self.is_recording = recording
@@ -698,6 +995,7 @@ class MainWindow(QWidget):
         self.stop_preview_btn.setEnabled(True)
         self.idle_label.setText("Connecting to preview stream...")
         self.media_stack.setCurrentWidget(self.idle_label)
+        self._reset_timeline()
         self.preview_worker = PreviewWorker(url)
         self.preview_worker.frame_ready.connect(self._on_preview_frame)
         self.preview_worker.error.connect(self._on_preview_error)
@@ -726,32 +1024,169 @@ class MainWindow(QWidget):
         self.media_stack.setCurrentWidget(self.idle_label)
 
     def _on_media_ready_to_view(self, local_path: str):
+        self._loading_filename = None
         path = Path(local_path)
         suffix = path.suffix.lower()
 
-        if suffix in IMAGE_EXTENSIONS:
-            pixmap = QPixmap(str(path)).scaled(
-                self.media_stack.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            if pixmap.isNull():
-                self.idle_label.setText(f"Could not load image:\n{path.name}")
-                self.media_stack.setCurrentWidget(self.idle_label)
-            else:
-                self.image_label.setPixmap(pixmap)
-                self.media_stack.setCurrentWidget(self.image_label)
+        if suffix in PHOTO_EXTENSIONS:
+            self._reset_timeline()
+            self._display_local_image(path)
+            self._add_viewed_thumbnail(path)
         elif suffix in VIDEO_EXTENSIONS:
             self.media_player.setSource(QUrl.fromLocalFile(str(path)))
             self.media_stack.setCurrentWidget(self.video_widget)
+            self.play_pause_btn.setEnabled(True)
             self.media_player.play()
+            self._start_timeline_thumbnails(path)
         else:
             self.idle_label.setText(f"Don't know how to display:\n{path.name}")
             self.media_stack.setCurrentWidget(self.idle_label)
+
+        self._update_info_panel(path.name, path)
+
+    def _on_download_progress(self, filename: str, current_bytes: int, total_bytes: int):
+        if filename != self._loading_filename:
+            return  # progress for a different (e.g. background) download
+        if total_bytes > 0:
+            percent = min(int(current_bytes / total_bytes * 100), 100)
+            self.idle_label.setText(f"Loading {filename}...\n{percent}%")
+        else:
+            self.idle_label.setText(f"Loading {filename}...\n{format_file_size(current_bytes)}")
+
+    def _display_local_image(self, path: Path):
+        pixmap = QPixmap(str(path)).scaled(
+            self.media_stack.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        if pixmap.isNull():
+            self.idle_label.setText(f"Could not load image:\n{path.name}")
+            self.media_stack.setCurrentWidget(self.idle_label)
+        else:
+            self.image_label.setPixmap(pixmap)
+            self.media_stack.setCurrentWidget(self.image_label)
+
+    # --- Viewed-images thumbnail panel ---------------------------------------
+
+    def _add_viewed_thumbnail(self, path: Path):
+        path_str = str(path)
+        if path_str in self.viewed_image_paths:
+            return
+        self.viewed_image_paths.add(path_str)
+        icon_pixmap = QPixmap(path_str).scaled(
+            96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        item = QListWidgetItem(QIcon(icon_pixmap), path.name)
+        item.setData(Qt.UserRole, path_str)
+        self.viewed_thumbs_list.addItem(item)
+
+    def _on_viewed_thumbnail_clicked(self, item: QListWidgetItem):
+        path_str = item.data(Qt.UserRole)
+        if not path_str:
+            return
+        if self.stop_preview_btn.isEnabled():
+            self.controller.stop_preview()
+        self.media_player.stop()
+        self._reset_timeline()
+        path = Path(path_str)
+        self._display_local_image(path)
+        self._update_info_panel(path.name, path)
+
+    # --- Video timeline -------------------------------------------------------
+
+    def _reset_timeline(self):
+        if self.thumbnail_worker is not None:
+            self.thumbnail_worker.quit()
+            self.thumbnail_worker.wait(2000)
+            self.thumbnail_worker = None
+        for label in self.timeline_thumb_labels:
+            label.clear()
+        self.timeline_slider.setRange(0, 0)
+        self.timeline_slider.setEnabled(False)
+        self.timeline_time_label.setText("00:00 / 00:00")
+        self.play_pause_btn.setEnabled(False)
+        self.play_pause_btn.setText("Play")
+        self.timeline_cursor.hide()
+
+    def _update_timeline_cursor(self, position_ms: int):
+        duration_ms = self.media_player.duration()
+        if duration_ms <= 0:
+            self.timeline_cursor.hide()
+            return
+        self.timeline_cursor.show()
+        fraction = min(max(position_ms / duration_ms, 0.0), 1.0)
+        usable_width = max(self.timeline_thumbs_container.width() - self.timeline_cursor.width(), 0)
+        x = int(fraction * usable_width)
+        self.timeline_cursor.move(x, 0)
+
+    def _start_timeline_thumbnails(self, path: Path):
+        for label in self.timeline_thumb_labels:
+            label.clear()
+        self.timeline_slider.setEnabled(True)
+        if not CV2_AVAILABLE:
+            return
+        self.thumbnail_worker = ThumbnailStripWorker(str(path))
+        self.thumbnail_worker.thumbnails_ready.connect(self._on_timeline_thumbnails_ready)
+        self.thumbnail_worker.error.connect(
+            lambda msg: self._append_log(f"Timeline thumbnail error: {msg}")
+        )
+        self.thumbnail_worker.start()
+
+    def _on_timeline_thumbnails_ready(self, thumbnails: list):
+        for label, pixmap in zip(self.timeline_thumb_labels, thumbnails):
+            label.setPixmap(
+                pixmap.scaled(
+                    label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                )
+            )
+
+    def _toggle_playback(self):
+        if self.media_player.playbackState() == QMediaPlayer.PlayingState:
+            self.media_player.pause()
+        else:
+            self.media_player.play()
+
+    def _on_playback_state_changed(self, state):
+        if state == QMediaPlayer.PlayingState:
+            self.play_pause_btn.setText("Pause")
+        else:
+            self.play_pause_btn.setText("Play")
+
+    def _on_player_position_changed(self, position_ms: int):
+        if not self._slider_being_dragged:
+            self.timeline_slider.blockSignals(True)
+            self.timeline_slider.setValue(position_ms)
+            self.timeline_slider.blockSignals(False)
+        duration_ms = self.media_player.duration()
+        self.timeline_time_label.setText(f"{format_ms(position_ms)} / {format_ms(duration_ms)}")
+        self._update_timeline_cursor(position_ms)
+
+    def _on_player_duration_changed(self, duration_ms: int):
+        self.timeline_slider.setRange(0, duration_ms)
+        self.timeline_slider.setEnabled(duration_ms > 0)
+        self._update_timeline_cursor(self.media_player.position())
+
+    def _on_timeline_slider_pressed(self):
+        self._slider_being_dragged = True
+
+    def _on_timeline_slider_moved(self, position_ms: int):
+        # Seek live while dragging, so the video scrubs instead of only
+        # jumping once the mouse button is released.
+        self.media_player.setPosition(position_ms)
+        duration_ms = self.media_player.duration()
+        self.timeline_time_label.setText(f"{format_ms(position_ms)} / {format_ms(duration_ms)}")
+        self._update_timeline_cursor(position_ms)
+
+    def _on_timeline_slider_released(self):
+        self._slider_being_dragged = False
+        self.media_player.setPosition(self.timeline_slider.value())
 
     def closeEvent(self, event):
         self.media_player.stop()
         if self.preview_worker is not None:
             self.preview_worker.stop()
             self.preview_worker.wait(2000)
+        if self.thumbnail_worker is not None:
+            self.thumbnail_worker.quit()
+            self.thumbnail_worker.wait(2000)
         if self.disconnect_btn.isEnabled():
             self.controller.disconnect()
         event.accept()
